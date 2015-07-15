@@ -2,3 +2,11 @@
 name = "DHT"
 version = "0.1.0"
 authors = ["tman <teemuka90@gmail.com>"]
+
+[dependencies]
+sha1 = "0.1.1"
+rustc-serialize = "0.3.15"
+byteorder = "*"
+
+[dependencies.mio]
+git = "https://github.com/carllerche/mio"
