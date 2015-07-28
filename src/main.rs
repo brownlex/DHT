@@ -15,10 +15,10 @@ use packet::*;
 use dhtpackettypes::*;
 use sha::*;
 use std::env;
+use std::io;
+use std::thread;
 
 fn main() {
-    //TODO: accept new connection from listener. left and right node. no need for hashmap?
-    //
     let listening_port = env::args().nth(1).expect("Invalid number of arguments.");
     let server_addr = "127.0.0.1:9155".parse().unwrap();
     let tcp_address = "127.0.0.1".to_string() + ":" + &listening_port;
@@ -26,6 +26,8 @@ fn main() {
     let sock = TcpStream::connect(&server_addr).unwrap();
 
     let mut event_loop = EventLoop::new().unwrap();
+    let sender = event_loop.channel();
+
     event_loop.register_opt(&listener,
                         LISTENER,
                         EventSet::readable(),
@@ -47,9 +49,16 @@ fn main() {
         clients: clients
     };
 
+    thread::spawn(move || {
+        let mut input = String::new();
+        let _ = io::stdin().read_line(&mut input).ok().expect("Failed to read line");
+        let _ = sender.send(input);
+    });
+
     let mut handler = MyHandler {
         node: node
     };
+
 
     event_loop.run(&mut handler).unwrap();
 }

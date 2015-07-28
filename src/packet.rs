@@ -7,6 +7,8 @@ use byteorder::{BigEndian, WriteBytesExt, ByteOrder};
 use sha::*;
 use dhtpackettypes::*;
 use std::str::from_utf8;
+use std::io;
+use std::thread;
 
 pub const DHT_SERVER_SHAKE: u16 = 0x413f;
 pub const DHT_CLIENT_SHAKE: u16 = 0x4121;
@@ -150,7 +152,7 @@ pub struct MyHandler<'a>  {
 
 impl<'a>  Handler for MyHandler<'a>  {
     type Timeout = ();
-    type Message = ();
+    type Message = String;
 
     fn ready(&mut self, event_loop: &mut EventLoop<MyHandler>, token: Token, _: EventSet) {
         match token {
@@ -202,6 +204,11 @@ impl<'a>  Handler for MyHandler<'a>  {
                               PollOpt::edge() | PollOpt::oneshot()).unwrap();
             }
         }
+    }
+
+    fn notify(&mut self, event_loop: &mut EventLoop<MyHandler>, msg: String) {
+        println!("{}", msg);
+        event_loop.shutdown();
     }
 
 }
