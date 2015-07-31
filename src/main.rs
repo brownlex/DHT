@@ -38,21 +38,32 @@ fn main() {
                         EventSet::readable(),
                         PollOpt::edge()).unwrap();
 
+    let server = Client {
+        socket: sock,
+        state: ClientState::Connected,
+        interest: EventSet::readable(),
+        tcp_address: "127.0.0.1:9155".to_string(),
+        node_key: gen_key(&"127.0.0.1:9155".to_string())
+    };
+
     let mut clients = HashMap::new();
-    clients.insert(CENTRAL_SERVER, sock);
+    clients.insert(CENTRAL_SERVER, server);
 
     let node = Node {
         listener: listener,
         state: NodeState::AwaitingHandshake,
-        tcp_address: &tcp_address,
+        tcp_address: tcp_address,
+        node_key: gen_key(&tcp_address),
         token_counter: 1,
         clients: clients
     };
 
     thread::spawn(move || {
-        let mut input = String::new();
-        let _ = io::stdin().read_line(&mut input).ok().expect("Failed to read line");
-        let _ = sender.send(input);
+        loop {
+            let mut input = String::new();
+            let _ = io::stdin().read_line(&mut input).ok().expect("Failed to read line");
+            let _ = sender.send(input);
+        }
     });
 
     let mut handler = MyHandler {

@@ -19,23 +19,76 @@ pub enum NodeState {
     AwaitingHandshake,
     Connected
 }
-
-pub struct Node<'a> {
-    pub token_counter: usize,
-    pub clients: HashMap<Token, TcpStream>,
-    pub listener: TcpListener,
-    pub state: NodeState,
-    pub tcp_address: &'a str
+//yhdistä nämä kaks? serverillä vois olla client state ja registering kun handshake vielä?
+pub enum ClientState {
+    Registering,
+    Connected
 }
 
-impl<'a>  Node<'a>  {
-    pub fn new_client(&mut self, sock: TcpStream, event_loop: &mut EventLoop<MyHandler>) {
+pub struct Client {
+    pub socket: TcpStream,
+    pub interest: EventSet,
+    pub state: ClientState,
+    pub tcp_address: String,
+    pub node_key: [u8; 20]
+}
+
+impl Client {
+    fn read(&mut self) -> Vec<u8> {
+        let mut data: Vec<u8> = vec![];
+        loop {
+            let mut buf = [0; 2048];
+            match self.socket.try_read(&mut buf) {
+                Err(e) => {
+                    println!("Error while reading socket: {:?}", e);
+                    break;
+                },
+                Ok(None) => 
+                    // Socket buffer has got no more bytes.
+                    break,
+                Ok(Some(len)) => {
+                    let slice = &buf[0..len];
+                    //how to make sure only one packet is received at a time?
+                    //move reading to main handler and use payload length to divide packets?
+                    //but sometimes whole packet doesn't come at once?
+                    println!("{}", len);
+                    data.extend(slice.iter().map(|&i| i));
+                }
+            }
+        }
+
+        data
+    }
+}
+//TODO: write/read for client instead of in program?
+
+pub struct Node {
+    pub token_counter: usize,
+    pub clients: HashMap<Token, Client>,
+    pub listener: TcpListener,
+    pub state: NodeState,
+    pub tcp_address: String,
+    pub node_key: [u8; 20]
+}
+
+impl  Node  {
+    pub fn new_client(&mut self, socket: TcpStream, event_loop: &mut EventLoop<MyHandler>, client_addr: String) {
         self.token_counter += 1;
         let new_token = Token(self.token_counter);
-        self.clients.insert(new_token, sock);
+        let client = Client {
+                        socket: socket,
+                        state: ClientState::Registering,
+                        interest: EventSet::writable(),
+                        tcp_address: client_addr,
+                        node_key: gen_key(&client_addr)
+                    };
 
-        event_loop.register_opt(&self.clients[&new_token], new_token,
-                    EventSet::readable(), PollOpt::edge() | PollOpt::oneshot()).unwrap();
+        self.clients.insert(new_token, client);
+        //writable at first because writing to a socket instantly after connecting sometimes
+        //returns errors. TODO tässä pitäs kattoo onko writable ja clientin state, jos 
+        //registering niin lähettää ACK paketin?
+        event_loop.register_opt(&self.clients[&new_token].socket, new_token,
+                    EventSet::writable(), PollOpt::edge() | PollOpt::oneshot()).unwrap();
     }
 
 }
@@ -67,39 +120,16 @@ pub fn send_packet(socket: &mut TcpStream,
 }
 
 pub fn handle_packet(token: Token, node: &mut Node, event_loop: &mut EventLoop<MyHandler>) {
-    let mut data: Vec<u8> = vec![];
-    //scoping so we can mutate node.clients later
-    {
-        let mut socket = node.clients.get_mut(&token).unwrap();
-        loop {
-            let mut buf = [0; 2048];
-            match socket.try_read(&mut buf) {
-                Err(e) => {
-                    println!("Error while reading socket: {:?}", e);
-                    return
-                },
-                Ok(None) =>
-                    // Socket buffer has got no more bytes.
-                    break,
-                Ok(Some(len)) => {
-                    let slice = &buf[0..len];
-                    //how to make sure only one packet is received at a time?
-                    //move reading to main handler and use payload length to divide packets?
-                    //but sometimes whole packet doesn't come at once?
-                    println!("{}", len);
-                    data.extend(slice.iter().map(|&i| i));
-                }
-            }
-        }
-    }
+    let data = node.clients.get_mut(&token).unwrap().read();
+    if data.len() == 0 {return}
 
     let request_type = BigEndian::read_u16(&data[40..42]);
     let payload_length = BigEndian::read_u16(&data[42..44]) as usize;
 
     match request_type {
         DHT_REGISTER_FAKE_ACK => {
-            let mut socket = node.clients.get_mut(&token).unwrap();
-            send_packet(socket, &data[0..20], &data[20..40], DHT_REGISTER_DONE, 0, &[]);
+            let mut server = node.clients.get_mut(&CENTRAL_SERVER).unwrap();
+            send_packet(&mut server.socket, &data[0..20], &data[20..40], DHT_REGISTER_DONE, 0, &[]);
         },
 
         DHT_REGISTER_BEGIN => {
@@ -107,15 +137,15 @@ pub fn handle_packet(token: Token, node: &mut Node, event_loop: &mut EventLoop<M
             let payload = from_utf8(&data[44..44 + payload_length]).unwrap();
             println!("Node's ip: {}", payload);
             let client_addr = payload.parse().unwrap();
+            /* new node, we connect to it and mark it as writable (in new_client()) so when
+            it's ready we can send the ACK-packet */
             match TcpStream::connect(&client_addr) {
                 Ok(sock) => {
                     let mut new_client = sock;
-                    send_packet(&mut new_client, &data[0..20], &data[20..40], DHT_REGISTER_ACK, 0, &[]);
-                    node.new_client(new_client, event_loop);
+                    node.new_client(new_client, event_loop, payload.to_string());
                 },
                 Err(e) => {
                     println!("Error trying to connect neighbour: {:?}", e);
-
                 }
             }
 
@@ -123,8 +153,8 @@ pub fn handle_packet(token: Token, node: &mut Node, event_loop: &mut EventLoop<M
 
         DHT_REGISTER_ACK => {
             //we need two acks, this is just temporary
-            let mut socket = node.clients.get_mut(&CENTRAL_SERVER).unwrap();
-            send_packet(socket, &data[0..20], &data[20..40], DHT_REGISTER_DONE, 0, &[])
+            let mut server = node.clients.get_mut(&CENTRAL_SERVER).unwrap();
+            send_packet(&mut server.socket, &data[0..20], &data[20..40], DHT_REGISTER_DONE, 0, &[])
         },
 
         _ => {
@@ -135,10 +165,10 @@ pub fn handle_packet(token: Token, node: &mut Node, event_loop: &mut EventLoop<M
 }
 
 fn register(node: &mut Node) {
-    let sha_key = gen_key(&node.tcp_address.to_string());
-    let mut socket = node.clients.get_mut(&CENTRAL_SERVER).unwrap();
+    let sha_key = gen_key(&node.tcp_address);
+    let mut client = node.clients.get_mut(&CENTRAL_SERVER).unwrap();
 
-    send_packet(&mut socket,
+    send_packet(&mut client.socket,
                 &sha_key[..],
                 &sha_key[..],
                 DHT_REGISTER_BEGIN,
@@ -146,62 +176,84 @@ fn register(node: &mut Node) {
                 node.tcp_address.as_bytes());
 }
 
-pub struct MyHandler<'a>  {
-    pub node: Node<'a> 
+pub struct MyHandler  {
+    pub node: Node 
 }
 
-impl<'a>  Handler for MyHandler<'a>  {
+impl Handler for MyHandler  {
     type Timeout = ();
     type Message = String;
 
-    fn ready(&mut self, event_loop: &mut EventLoop<MyHandler>, token: Token, _: EventSet) {
-        match token {
-            CENTRAL_SERVER => {
-                // server answered
-                match self.node.state {
-                        NodeState::AwaitingHandshake => {
-                            let mut buf = [0; 2048];
-                            //the handshake is always "A?", we just send "A!" back
-                            //scoping so borrowing only here and register can take it
-                            {
-                            let mut socket = self.node.clients.get_mut(&CENTRAL_SERVER).unwrap();
-                            socket.try_read(&mut buf).unwrap();
-                            socket.try_write("A!".as_bytes()).unwrap();
-                            self.node.state = NodeState::Connected;
-                            println!("handshake");
-                            }
-                            register(&mut self.node);
+    fn ready(&mut self, event_loop: &mut EventLoop<MyHandler>, token: Token, events: EventSet) {
+        if events.is_readable() {
+            match token {
+                CENTRAL_SERVER => {
+                    // server answered
+                    match self.node.state {
+                            NodeState::AwaitingHandshake => {
+                                let mut buf = [0; 2048];
+                                //the handshake is always "A?", we just send "A!" back
+                                //scoping so borrowing only here and register can take it
+                                {
+                                let mut client = self.node.clients.get_mut(&CENTRAL_SERVER).unwrap();
+                                client.socket.try_read(&mut buf).unwrap();
+                                client.socket.try_write("A!".as_bytes()).unwrap();
+                                self.node.state = NodeState::Connected;
+                                println!("handshake");
+                                }
+                                register(&mut self.node);
 
+                            },
+
+                            NodeState::Connected => {
+                                handle_packet(CENTRAL_SERVER, &mut self.node, event_loop);
+                            }
+                        }
+                },
+
+
+                LISTENER => {
+                    //another node connected
+                    let mut neighbour_socket = match self.node.listener.accept() {
+                            Err(e) => {
+                                println!("Accept error: {}", e);
+                                return;
+                            },
+                            Ok(None) => panic!("Accept has returned 'None'"),
+                            Ok(Some(sock)) => sock
+                        };
+                    println!("Accepted something");
+                    //jos ei käytetä '&' niin me annetaan tämä socket tälle, joka laittaa sen hashmappiin
+                    //joka sitten omistaa socketin
+                    //TODO: täytyykö laittaa ip clienttiin oikeastaan? ja saako iptä tähän mitenkääm?
+                    self.node.new_client(neighbour_socket, event_loop);
+
+                },
+
+                token => {
+                    handle_packet(token, &mut self.node, event_loop);
+                    event_loop.reregister(&self.node.clients[&token].socket, token, EventSet::readable(),
+                                  PollOpt::edge() | PollOpt::oneshot()).unwrap();
+                }
+            }
+        }
+
+        if events.is_writable() {
+            match token {
+                token => {
+                    let mut client = self.node.clients.get_mut(&token).unwrap();
+                    match client.state {
+                        ClientState::Registering => {
+                            send_packet(&mut client.socket, &client.node_key, &client.node_key, DHT_REGISTER_ACK, 0, &[]);
                         },
 
-                        NodeState::Connected => {
-                            handle_packet(CENTRAL_SERVER, &mut self.node, event_loop);
+                        ClientState::Connected => {
+                            println!("lel");
                         }
                     }
-            },
+                }
 
-
-            LISTENER => {
-                //another node
-                let mut neighbour_socket = match self.node.listener.accept() {
-                        Err(e) => {
-                            println!("Accept error: {}", e);
-                            return;
-                        },
-                        Ok(None) => panic!("Accept has returned 'None'"),
-                        Ok(Some(sock)) => sock
-                    };
-                println!("Accepted something");
-                //jos ei käytetä '&' niin me annetaan tämä socket tälle, joka laittaa sen hashmappiin
-                //joka sitten omistaa socketin
-                self.node.new_client(neighbour_socket, event_loop);
-
-            },
-
-            token => {
-                handle_packet(token, &mut self.node, event_loop);
-                event_loop.reregister(&self.node.clients[&token], token, EventSet::readable(),
-                              PollOpt::edge() | PollOpt::oneshot()).unwrap();
+                _ => {println!("nutting");}
             }
         }
     }
