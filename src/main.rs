@@ -42,8 +42,7 @@ fn main() {
         socket: sock,
         state: ClientState::Connected,
         interest: EventSet::readable(),
-        tcp_address: "127.0.0.1:9155".to_string(),
-        node_key: gen_key(&"127.0.0.1:9155".to_string())
+        sending_data: vec![]
     };
 
     let mut clients = HashMap::new();
@@ -52,8 +51,8 @@ fn main() {
     let node = Node {
         listener: listener,
         state: NodeState::AwaitingHandshake,
-        tcp_address: tcp_address,
         node_key: gen_key(&tcp_address),
+        tcp_address: tcp_address,
         token_counter: 1,
         clients: clients
     };

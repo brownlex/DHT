@@ -19,7 +19,7 @@ pub enum NodeState {
     AwaitingHandshake,
     Connected
 }
-//yhdistä nämä kaks? serverillä vois olla client state ja registering kun handshake vielä?
+
 pub enum ClientState {
     Registering,
     Connected
@@ -29,8 +29,11 @@ pub struct Client {
     pub socket: TcpStream,
     pub interest: EventSet,
     pub state: ClientState,
-    pub tcp_address: String,
-    pub node_key: [u8; 20]
+    /* this is used when we connect to a new socket. we cant immediately write to the new socket
+    because sometimes it cant connect before writing to it. we use this part instead and save the data
+    we want to send to the new socket here, and when it triggers a writable event we write this data to the socket */
+    pub sending_data: Vec<u8> 
+
 }
 
 impl Client {
@@ -59,6 +62,13 @@ impl Client {
 
         data
     }
+
+    fn write(&mut self) {
+        match self.socket.try_write(&self.sending_data) {
+            Err(e) => {println!("Error while writing to a socket: {:?}", e);},
+            _ => {println!("Write ok");}
+        }
+    }
 }
 //TODO: write/read for client instead of in program?
 
@@ -71,24 +81,14 @@ pub struct Node {
     pub node_key: [u8; 20]
 }
 
-impl  Node  {
-    pub fn new_client(&mut self, socket: TcpStream, event_loop: &mut EventLoop<MyHandler>, client_addr: String) {
+impl Node  {
+    pub fn new_client(&mut self, client: Client, event_loop: &mut EventLoop<MyHandler>) {
         self.token_counter += 1;
         let new_token = Token(self.token_counter);
-        let client = Client {
-                        socket: socket,
-                        state: ClientState::Registering,
-                        interest: EventSet::writable(),
-                        tcp_address: client_addr,
-                        node_key: gen_key(&client_addr)
-                    };
 
         self.clients.insert(new_token, client);
-        //writable at first because writing to a socket instantly after connecting sometimes
-        //returns errors. TODO tässä pitäs kattoo onko writable ja clientin state, jos 
-        //registering niin lähettää ACK paketin?
         event_loop.register_opt(&self.clients[&new_token].socket, new_token,
-                    EventSet::writable(), PollOpt::edge() | PollOpt::oneshot()).unwrap();
+                    self.clients[&new_token].interest, PollOpt::edge() | PollOpt::oneshot()).unwrap();
     }
 
 }
@@ -119,7 +119,29 @@ pub fn send_packet(socket: &mut TcpStream,
     }
 }
 
-pub fn handle_packet(token: Token, node: &mut Node, event_loop: &mut EventLoop<MyHandler>) {
+pub fn make_packet(target_key: &[u8], 
+                sender_key: &[u8],
+                request_type: u16,
+                payload_length: u16,
+                payload: &[u8]) -> Vec<u8>
+{
+    let mut data: Vec<u8> = Vec::new();
+    //map() maps the &i to i?
+    data.extend(target_key.iter().map(|&i| i));
+    data.extend(sender_key.iter().map(|&i| i));
+    let mut type_as_bytes = vec![];
+    let mut len_as_bytes = vec![];
+    //vectors implement Write so this works?
+    type_as_bytes.write_u16::<BigEndian>(request_type).unwrap();
+    len_as_bytes.write_u16::<BigEndian>(payload_length).unwrap();
+    data.extend(type_as_bytes);
+    data.extend(len_as_bytes);
+    data.extend(payload.iter().map(|&i| i));
+
+    data
+}
+
+pub fn handle_packet (token: Token, node: &mut Node, event_loop: &mut EventLoop<MyHandler>) {
     let data = node.clients.get_mut(&token).unwrap().read();
     if data.len() == 0 {return}
 
@@ -137,12 +159,21 @@ pub fn handle_packet(token: Token, node: &mut Node, event_loop: &mut EventLoop<M
             let payload = from_utf8(&data[44..44 + payload_length]).unwrap();
             println!("Node's ip: {}", payload);
             let client_addr = payload.parse().unwrap();
-            /* new node, we connect to it and mark it as writable (in new_client()) so when
+            /* new node, we connect to it and mark it as writable so when
             it's ready we can send the ACK-packet */
             match TcpStream::connect(&client_addr) {
                 Ok(sock) => {
-                    let mut new_client = sock;
-                    node.new_client(new_client, event_loop, payload.to_string());
+                    let mut new_client_sock = sock;
+                    //writable at first because writing to a socket instantly after connecting sometimes fails
+                    let sending_data = make_packet(&data[0..20], &data[20..40], DHT_REGISTER_ACK, 0, &[]);
+                    let client = Client {
+                        socket: new_client_sock,
+                        interest: EventSet::writable(),
+                        state: ClientState::Registering,
+                        sending_data: sending_data
+                    };
+
+                    node.new_client(client, event_loop);
                 },
                 Err(e) => {
                     println!("Error trying to connect neighbour: {:?}", e);
@@ -158,7 +189,7 @@ pub fn handle_packet(token: Token, node: &mut Node, event_loop: &mut EventLoop<M
         },
 
         _ => {
-            println!("request_type not expected");
+            println!("request type not expected");
         }
     }
 
@@ -176,11 +207,11 @@ fn register(node: &mut Node) {
                 node.tcp_address.as_bytes());
 }
 
-pub struct MyHandler  {
+pub struct MyHandler {
     pub node: Node 
 }
 
-impl Handler for MyHandler  {
+impl Handler for MyHandler   {
     type Timeout = ();
     type Message = String;
 
@@ -223,10 +254,15 @@ impl Handler for MyHandler  {
                             Ok(Some(sock)) => sock
                         };
                     println!("Accepted something");
-                    //jos ei käytetä '&' niin me annetaan tämä socket tälle, joka laittaa sen hashmappiin
-                    //joka sitten omistaa socketin
-                    //TODO: täytyykö laittaa ip clienttiin oikeastaan? ja saako iptä tähän mitenkääm?
-                    self.node.new_client(neighbour_socket, event_loop);
+                    //tässä pitää olla readable aluksi koska odotat viestiä toiselta
+                    let client = Client {
+                        socket: neighbour_socket,
+                        interest: EventSet::readable(),
+                        state: ClientState::Registering,
+                        sending_data: vec![]
+                    };
+
+                    self.node.new_client(client, event_loop);
 
                 },
 
@@ -244,7 +280,8 @@ impl Handler for MyHandler  {
                     let mut client = self.node.clients.get_mut(&token).unwrap();
                     match client.state {
                         ClientState::Registering => {
-                            send_packet(&mut client.socket, &client.node_key, &client.node_key, DHT_REGISTER_ACK, 0, &[]);
+                            client.write();
+                            client.state = ClientState::Connected;
                         },
 
                         ClientState::Connected => {
@@ -252,8 +289,6 @@ impl Handler for MyHandler  {
                         }
                     }
                 }
-
-                _ => {println!("nutting");}
             }
         }
     }
