@@ -9,6 +9,7 @@ use dhtpackettypes::*;
 use std::str::from_utf8;
 use std::io;
 use std::thread;
+use std::net::SocketAddr;
 
 pub const DHT_SERVER_SHAKE: u16 = 0x413f;
 pub const DHT_CLIENT_SHAKE: u16 = 0x4121;
@@ -17,11 +18,14 @@ pub const CENTRAL_SERVER: Token = Token(1);
 
 pub enum NodeState {
     AwaitingHandshake,
+    Registering,
+    OneAck,
     Connected
 }
 
 pub enum ClientState {
     Registering,
+    OneAck,
     Connected
 }
 
@@ -54,7 +58,7 @@ impl Client {
                     //how to make sure only one packet is received at a time?
                     //move reading to main handler and use payload length to divide packets?
                     //but sometimes whole packet doesn't come at once?
-                    println!("{}", len);
+                    //println!("{}", len);
                     data.extend(slice.iter().map(|&i| i));
                 }
             }
@@ -115,7 +119,7 @@ pub fn send_packet(socket: &mut TcpStream,
 
     match socket.try_write(&data[..]) {
         Err(e) => {println!("Error while writing to a socket: {:?}", e);},
-        _ => {println!("Write ok");}
+        _ => {}
     }
 }
 
@@ -141,52 +145,85 @@ pub fn make_packet(target_key: &[u8],
     data
 }
 
+fn connect_and_prepare_packet(payload: &str, node: &mut Node, sending_data: Vec<u8>,
+                                event_loop: &mut EventLoop<MyHandler>) {
+    let client_addr: SocketAddr = payload.parse().unwrap();
+    match TcpStream::connect(&client_addr) {
+        Ok(sock) => {
+            let mut new_client_sock = sock;
+            //writable at first because writing to a socket instantly after connecting sometimes fails
+            let client = Client {
+                socket: new_client_sock,
+                interest: EventSet::writable(),
+                state: ClientState::Registering,
+                sending_data: sending_data
+            };
+
+            node.new_client(client, event_loop);
+        },
+        Err(e) => {
+            println!("Error trying to connect neighbour: {:?}", e);
+        }
+    }
+}
+
 pub fn handle_packet (token: Token, node: &mut Node, event_loop: &mut EventLoop<MyHandler>) {
     let data = node.clients.get_mut(&token).unwrap().read();
-    if data.len() == 0 {return}
+    if data.len() < 44 {return} //if whole packet didnt get here we ignore it.. patchwork
 
     let request_type = BigEndian::read_u16(&data[40..42]);
     let payload_length = BigEndian::read_u16(&data[42..44]) as usize;
 
     match request_type {
+        //we are the first node
         DHT_REGISTER_FAKE_ACK => {
             let mut server = node.clients.get_mut(&CENTRAL_SERVER).unwrap();
+            node.state = NodeState::Connected;
             send_packet(&mut server.socket, &data[0..20], &data[20..40], DHT_REGISTER_DONE, 0, &[]);
         },
 
+        /* new node, we connect to it and mark it as writable so when
+            it's ready we can send the ACK-packet */
         DHT_REGISTER_BEGIN => {
-            println!("New node joined");
             let payload = from_utf8(&data[44..44 + payload_length]).unwrap();
             println!("Node's ip: {}", payload);
-            let client_addr = payload.parse().unwrap();
-            /* new node, we connect to it and mark it as writable so when
-            it's ready we can send the ACK-packet */
-            match TcpStream::connect(&client_addr) {
-                Ok(sock) => {
-                    let mut new_client_sock = sock;
-                    //writable at first because writing to a socket instantly after connecting sometimes fails
-                    let sending_data = make_packet(&data[0..20], &data[20..40], DHT_REGISTER_ACK, 0, &[]);
-                    let client = Client {
-                        socket: new_client_sock,
-                        interest: EventSet::writable(),
-                        state: ClientState::Registering,
-                        sending_data: sending_data
-                    };
+            let sending_data = make_packet(&data[0..20], &data[20..40], DHT_REGISTER_ACK, 0, &[]);
+            connect_and_prepare_packet(payload, node, sending_data, event_loop);
 
-                    node.new_client(client, event_loop);
+        },
+
+        //neighbour nodes acknowledge register
+        DHT_REGISTER_ACK => {
+            match node.state {
+                NodeState::Registering => {
+                    let mut server = node.clients.get_mut(&CENTRAL_SERVER).unwrap();
+                    send_packet(&mut server.socket, &data[0..20], &data[20..40], DHT_REGISTER_DONE, 0, &[]);
+                    node.state = NodeState::Connected;
                 },
-                Err(e) => {
-                    println!("Error trying to connect neighbour: {:?}", e);
+
+                _ => {
+                    println!("Already sent register done, ignoring");
                 }
             }
-
         },
 
-        DHT_REGISTER_ACK => {
-            //we need two acks, this is just temporary
-            let mut server = node.clients.get_mut(&CENTRAL_SERVER).unwrap();
-            send_packet(&mut server.socket, &data[0..20], &data[20..40], DHT_REGISTER_DONE, 0, &[])
+        //server responded and we begin deregistering
+        DHT_DEREGISTER_ACK => {
+            let midpoint = 44 + payload_length/2;
+            let first_address = from_utf8(&data[44..midpoint]).unwrap();
+            let second_address = from_utf8(&data[midpoint..44+payload_length]).unwrap();
+            //shiiet connect ja mark as writable ja sendii samalla tavalla?
+            let first_sending_data = make_packet(&node.node_key, &node.node_key, DHT_DEREGISTER_BEGIN, 0, &[]);
+            connect_and_prepare_packet(first_address, node, first_sending_data, event_loop);
+
+            let second_sending_data = make_packet(&node.node_key, &node.node_key, DHT_DEREGISTER_BEGIN, 0, &[]);
+            connect_and_prepare_packet(first_address, node, second_sending_data, event_loop);
         },
+
+        //a node wants to deregister
+        DHT_DEREGISTER_BEGIN => {
+
+        }
 
         _ => {
             println!("request type not expected");
@@ -199,12 +236,14 @@ fn register(node: &mut Node) {
     let sha_key = gen_key(&node.tcp_address);
     let mut client = node.clients.get_mut(&CENTRAL_SERVER).unwrap();
 
-    send_packet(&mut client.socket,
-                &sha_key[..],
-                &sha_key[..],
-                DHT_REGISTER_BEGIN,
+    send_packet(&mut client.socket, &sha_key[..], &sha_key[..], DHT_REGISTER_BEGIN,
                 node.tcp_address.len() as u16,
                 node.tcp_address.as_bytes());
+}
+
+fn deregister(node: &mut Node) {
+    let mut server = node.clients.get_mut(&CENTRAL_SERVER).unwrap();
+    send_packet(&mut server.socket, &node.node_key, &node.node_key, DHT_DEREGISTER_BEGIN, 0, &[])
 }
 
 pub struct MyHandler {
@@ -213,7 +252,7 @@ pub struct MyHandler {
 
 impl Handler for MyHandler   {
     type Timeout = ();
-    type Message = String;
+    type Message = u32;
 
     fn ready(&mut self, event_loop: &mut EventLoop<MyHandler>, token: Token, events: EventSet) {
         if events.is_readable() {
@@ -229,14 +268,13 @@ impl Handler for MyHandler   {
                                 let mut client = self.node.clients.get_mut(&CENTRAL_SERVER).unwrap();
                                 client.socket.try_read(&mut buf).unwrap();
                                 client.socket.try_write("A!".as_bytes()).unwrap();
-                                self.node.state = NodeState::Connected;
-                                println!("handshake");
+                                self.node.state = NodeState::Registering;
                                 }
                                 register(&mut self.node);
 
                             },
 
-                            NodeState::Connected => {
+                            _ => {
                                 handle_packet(CENTRAL_SERVER, &mut self.node, event_loop);
                             }
                         }
@@ -282,9 +320,10 @@ impl Handler for MyHandler   {
                         ClientState::Registering => {
                             client.write();
                             client.state = ClientState::Connected;
+                            //remove from hashtable? as we send only one packet?
                         },
 
-                        ClientState::Connected => {
+                        _ => {
                             println!("lel");
                         }
                     }
@@ -293,9 +332,18 @@ impl Handler for MyHandler   {
         }
     }
 
-    fn notify(&mut self, event_loop: &mut EventLoop<MyHandler>, msg: String) {
-        println!("{}", msg);
-        event_loop.shutdown();
+    fn notify(&mut self, event_loop: &mut EventLoop<MyHandler>, msg: u32) {
+        match msg {
+            1 => {
+                println!("Starting deregister sequence");
+                deregister(&mut self.node);
+            },
+
+            _ => {
+                println!("Command not found");
+            }
+        }
+        //event_loop.shutdown();
     }
 
 }

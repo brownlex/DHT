@@ -18,6 +18,11 @@ use std::env;
 use std::io;
 use std::thread;
 
+fn print_instructions() {
+    println!("Input a number:");
+    println!("1. Deregister");
+}
+
 fn main() {
     let listening_port = env::args().nth(1).expect("Invalid number of arguments.");
     let server_addr = "127.0.0.1:9155".parse().unwrap();
@@ -61,7 +66,8 @@ fn main() {
         loop {
             let mut input = String::new();
             let _ = io::stdin().read_line(&mut input).ok().expect("Failed to read line");
-            let _ = sender.send(input);
+            let input_number: u32 = input.parse::<u32>().unwrap();
+            let _ = sender.send(input_number);
         }
     });
 
@@ -69,6 +75,6 @@ fn main() {
         node: node
     };
 
-
+    print_instructions();
     event_loop.run(&mut handler).unwrap();
 }
