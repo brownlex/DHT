@@ -36,6 +36,7 @@ pub struct Client {
     /* this is used when we connect to a new socket. we cant immediately write to the new socket
     because sometimes it cant connect before writing to it. we use this part instead and save the data
     we want to send to the new socket here, and when it triggers a writable event we write this data to the socket */
+    pub client_key: [u8; 20],
     pub sending_data: Vec<u8> 
 
 }
@@ -74,7 +75,6 @@ impl Client {
         }
     }
 }
-//TODO: write/read for client instead of in program?
 
 pub struct Node {
     pub token_counter: usize,
@@ -222,7 +222,9 @@ pub fn handle_packet (token: Token, node: &mut Node, event_loop: &mut EventLoop<
 
         //a node wants to deregister
         DHT_DEREGISTER_BEGIN => {
-
+            let client_key = node.clients.get_mut(&token).unwrap().
+            let mut server = node.clients.get_mut(&CENTRAL_SERVER).unwrap();
+            send_packet(&mut server.socket, &data[0..20], &node.node_key, DHT_DEREGISTER_DONE, 0, &[]);
         }
 
         _ => {
